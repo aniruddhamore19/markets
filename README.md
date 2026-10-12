@@ -28,6 +28,17 @@ about a minute to wake it up, then data fills in over the next few seconds.
 4. Back on Render click Verify. HTTPS is added automatically. The bare `marketsbyaniruddha.com`
    redirects to `www` on its own.
 
+## If the page shows "Waiting for the first data"
+- After a sleep, the first load takes a minute or two on the free plan. Under the message the page
+  now says how long the server has been up and how long each source has been loading.
+- A source that does not answer shows "Timed out after ... the data source is not responding"
+  instead of waiting forever.
+- While signed in, open `/api/status` on your site (for example
+  `https://marketsbyaniruddha.onrender.com/api/status`) to see what the server is doing.
+  Screenshot it if you need help.
+- On Render the data refreshes more gently than on your PC: prices every 10 seconds, news 30,
+  OI/PCR and FII/DII every 2 minutes. This keeps the small free server and the data sources happy.
+
 ## Notes
 - To make the site public with no login, delete the `TERMINAL_PASSWORD` setting on Render.
 - To change the password later: Render -> service -> Environment -> edit `TERMINAL_PASSWORD`.

@@ -294,6 +294,17 @@ INTERVALS = {
     "calendar_actuals": 300,
 }
 
+# On a web host (Render sets RENDER=true) the machine is small and the data sources can block a
+# server that asks too often, so refresh more gently. On your own PC the fast timings stay.
+HOSTED = bool(os.environ.get("RENDER")) or os.environ.get("KOTAK_DESK_HOSTED") == "1"
+if HOSTED:
+    INTERVALS.update({"prices": 10, "news": 30, "oi": 120, "fii_attempt": 120, "calendar_actuals": 600})
+
+# A source that does not answer must not leave the page on "waiting" forever.
+TASK_TIMEOUT = {"prices": 90, "news": 60, "oi": 120, "fii_attempt": 150, "calendar": 180, "calendar_actuals": 120}
+MAX_STUCK_PER_TASK = 3
+STARTED_AT = time.time()
+
 
 def is_due(module: str) -> bool:
     return time.time() >= _next_run.get(module, 0.0)
@@ -1239,6 +1250,8 @@ def fetch_all_oi() -> list[dict[str, Any]]:
 # Shared store: background threads write, the web server reads
 # ----------------------------------------------------------------------------
 MODULE_INTERVAL = {"prices": 5, "news": 10, "oi": 5, "fii": 60, "calendar": 300}
+if HOSTED:
+    MODULE_INTERVAL.update({"prices": 10, "news": 30, "oi": 120, "fii": 120, "calendar": 600})
 MODULE_LABEL = {
     "prices": "PRICES",
     "news": "NEWS",
@@ -1310,6 +1323,11 @@ class Store:
                 state.update(error=message, version=state["version"] + 1)
         if changed:
             log.warning("%s | refresh failed: %s", MODULE_LABEL[name], message)
+
+    def brief(self, name: str) -> dict[str, Any]:
+        with self._lock:
+            state = self._s[name]
+            return {"has_data": state["data"] is not None, "error": state["error"], "updated": state["updated"]}
 
     def view(self, name: str, since: int | None) -> dict[str, Any]:
         with self._lock:
@@ -1420,26 +1438,67 @@ def finish_task(task: str, future) -> None:
             mark_done("calendar_actuals")
 
 
+TASK_INFO: dict[str, dict[str, Any]] = {
+    task: {"running_since": None, "last_duration": None, "stuck": 0} for task in TASK_MODULE
+}
+
+
 def scheduler_loop(stop: threading.Event) -> None:
     force_all_modules_due()
-    pending: dict[str, Any] = {}
-    executor = ThreadPoolExecutor(max_workers=6)
+    pending: dict[str, tuple[Any, float]] = {}  # task -> (future, start time)
+    stuck: dict[str, list[Any]] = {task: [] for task in TASK_MODULE}  # given up on, still running
+    executor = ThreadPoolExecutor(max_workers=24)
+
+    def start(task: str) -> None:
+        now = time.time()
+        pending[task] = (submit_task(executor, task), now)
+        TASK_INFO[task]["running_since"] = now
+
     while not stop.is_set():
         try:
+            now = time.time()
+
+            # A request we gave up on may still finish later: use its data if it does.
+            for task in stuck:
+                for future in [f for f in stuck[task] if f.done()]:
+                    stuck[task].remove(future)
+                    finish_task(task, future)
+                TASK_INFO[task]["stuck"] = len(stuck[task])
+
+            def can_start(task: str) -> bool:
+                return task not in pending and len(stuck[task]) < MAX_STUCK_PER_TASK
+
             for task in ("prices", "news", "oi", "fii_attempt"):
-                if is_due(task) and task not in pending:
-                    pending[task] = submit_task(executor, task)
+                if is_due(task):
+                    if can_start(task):
+                        start(task)
+                    elif task not in pending:
+                        store.fail(TASK_MODULE[task], "Data source is not responding - waiting for earlier requests to finish")
 
             calendar_busy = "calendar" in pending or "calendar_actuals" in pending
             if not calendar_busy:
-                if is_due("calendar"):
-                    pending["calendar"] = submit_task(executor, "calendar")
-                elif is_due("calendar_actuals"):
-                    pending["calendar_actuals"] = submit_task(executor, "calendar_actuals")
+                if is_due("calendar") and can_start("calendar"):
+                    start("calendar")
+                elif is_due("calendar_actuals") and can_start("calendar_actuals"):
+                    start("calendar_actuals")
 
             for task in list(pending):
-                if pending[task].done():
-                    finish_task(task, pending.pop(task))
+                future, started = pending[task]
+                if future.done():
+                    pending.pop(task)
+                    TASK_INFO[task].update(running_since=None, last_duration=round(now - started, 1))
+                    finish_task(task, future)
+                elif now - started > TASK_TIMEOUT[task]:
+                    pending.pop(task)
+                    stuck[task].append(future)
+                    TASK_INFO[task].update(running_since=None, stuck=len(stuck[task]))
+                    store.fail(
+                        TASK_MODULE[task],
+                        f"Timed out after {int(now - started)}s - the data source is not responding",
+                    )
+                    mark_done(task)
+                    if task == "calendar":
+                        mark_done("calendar_actuals")
         except RuntimeError as exc:
             if "shutdown" in str(exc):
                 break  # the program is exiting; nothing more to refresh
@@ -1498,6 +1557,40 @@ def start_background_refresh() -> None:
 @app.route("/")
 def index() -> Response:
     resp = Response(INDEX_HTML, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/status")
+def api_status():
+    """What the server is doing right now. The page shows this while it waits for data."""
+    now = time.time()
+    tasks = {}
+    for task, info in TASK_INFO.items():
+        since = info["running_since"]
+        tasks[task] = {
+            "running_for": round(now - since, 1) if since else None,
+            "last_duration": info["last_duration"],
+            "stuck": info["stuck"],
+        }
+    peak_mb = None
+    if sys.platform == "linux":
+        try:
+            import resource
+
+            peak_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+        except Exception:
+            pass
+    refresher = next((t for t in threading.enumerate() if t.name == "scheduler"), None)
+    resp = jsonify(
+        uptime=round(now - STARTED_AT, 1),
+        scheduler_alive=bool(refresher and refresher.is_alive()),
+        hosted=HOSTED,
+        peak_memory_mb=peak_mb,
+        tasks=tasks,
+        modules={name: store.brief(name) for name in MODULE_INTERVAL},
+        versions={"python": sys.version.split()[0], "pandas": pd.__version__, "yfinance": getattr(yf, "__version__", None)},
+    )
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -1608,6 +1701,7 @@ td.fdn{animation:fdn 1.1s ease-out}
 .foot{flex:none;padding:5px 14px;border-top:1px solid var(--line);font:11px var(--mono);color:var(--dim);background:var(--panel)}
 .empty{padding:70px 20px;text-align:center;color:var(--dim);font:13px var(--mono)}
 .empty b{color:var(--dn);display:block;font-size:14px;margin-bottom:8px}
+.empty small{display:block;margin-top:12px;font-size:12px}
 
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;padding:12px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:12px 14px}
@@ -1651,7 +1745,7 @@ td.fdn{animation:fdn 1.1s ease-out}
   <div class="clock" id="clock"></div>
 </header>
 <div class="banner" id="banner" hidden></div>
-<div class="banner" id="offline" hidden>Lost connection to the terminal server. Check the PowerShell window - retrying.</div>
+<div class="banner" id="offline" hidden>Lost connection to the terminal server - retrying. If this stays, the server may be restarting or stopped.</div>
 <section class="tiles" id="tiles" aria-label="Key prices"></section>
 <nav class="tabs" id="tabs">
   <button class="tab-btn active" data-tab="prices"><span class="k">1</span>Live prices</button>
@@ -1717,9 +1811,25 @@ const TABS = ['prices', 'news', 'fii', 'calendar', 'oi'];
 const S = {};
 let skew = 0, failures = 0;
 
-function emptyMsg(m) {
+/* What the server is doing, shown while a pane has no data yet (filled in by pollStatus). */
+let statusInfo = null, statusFailed = false;
+const TASKS_OF = { prices: ['prices'], news: ['news'], fii: ['fii_attempt'], calendar: ['calendar', 'calendar_actuals'], oi: ['oi'] };
+const fmtDur = s => s < 90 ? Math.round(s) + 's' : Math.round(s / 60) + ' min';
+function waitDetail(key) {
+  if (statusFailed) return '<small>The server is not answering yet. It may be starting up or restarting - this page keeps trying.</small>';
+  if (!statusInfo) return '';
+  const bits = ['Server running for ' + fmtDur(statusInfo.uptime) + '.'];
+  if (!statusInfo.scheduler_alive) {
+    bits.push('The data refresh process is not running.');
+  } else {
+    const running = (TASKS_OF[key] || []).map(k => statusInfo.tasks[k]).find(t => t && t.running_for != null);
+    bits.push(running ? 'This data has been loading for ' + fmtDur(running.running_for) + '.' : 'This data is queued for its first load.');
+  }
+  return '<small>' + esc(bits.join(' ')) + '</small>';
+}
+function emptyMsg(m, key) {
   if (m && m.error) return '<div class="empty"><b>[!] DATA TEMPORARILY UNAVAILABLE</b>' + esc(m.error) + '<br>Retrying automatically.</div>';
-  return '<div class="empty">Waiting for the first data...</div>';
+  return '<div class="empty">Waiting for the first data...' + waitDetail(key) + '</div>';
 }
 function staleNote(m) {
   return (m && m.data && m.error) ? '<div class="empty" style="padding:8px"><span class="bad">Showing last good data - latest refresh failed: ' + esc(m.error) + '</span></div>' : '';
@@ -1741,7 +1851,7 @@ function renderTiles(rows) {
 
 function renderPrices() {
   const m = S.prices, view = $('#prices-view');
-  if (!m || !m.data) { view.innerHTML = emptyMsg(m); renderTiles([]); return; }
+  if (!m || !m.data) { view.innerHTML = emptyMsg(m, 'prices'); renderTiles([]); return; }
   const rows = m.data;
   let html = staleNote(m) + '<table><thead><tr><th>Watchlist</th><th>Ticker</th><th>Description</th><th>Price</th><th>Chg %</th><th>Exchange</th><th>Timestamp</th><th>Status</th></tr></thead><tbody>';
   rows.forEach(r => {
@@ -1790,7 +1900,7 @@ function onNews() {
 
 function renderNews() {
   const m = S.news, view = $('#news-view');
-  if (!m || !m.data) { view.innerHTML = emptyMsg(m); $('#news-meta').textContent = ''; return; }
+  if (!m || !m.data) { view.innerHTML = emptyMsg(m, 'news'); $('#news-meta').textContent = ''; return; }
   const q = newsQ.trim().toLowerCase();
   const rows = m.data.filter(n => (!newsBrk || n.Breaking) && (!q || ((n.Headline || '') + ' ' + (n.Source || '')).toLowerCase().includes(q)));
   $('#news-meta').textContent = rows.length + ' of ' + m.data.length + ' headlines';
@@ -1809,7 +1919,7 @@ function renderNews() {
 /* ---------- FII / DII ---------- */
 function renderFii() {
   const m = S.fii, view = $('#fii-view');
-  if (!m || !m.data) { view.innerHTML = emptyMsg(m); return; }
+  if (!m || !m.data) { view.innerHTML = emptyMsg(m, 'fii'); return; }
   const rows = m.data;
   const cards = rows.filter(r => isNum(r['Net (Cr)'])).map(r => {
     const n = r['Net (Cr)'];
@@ -1832,7 +1942,7 @@ let calWeek = 'this', calImpact = 'all';
 const num = v => { if (v == null) return NaN; const s = String(v).replace(/[%,KMBT\s]/gi, ''); if (s === '' || s === '-') return NaN; return parseFloat(s); };
 function renderCalendar() {
   const m = S.calendar, view = $('#calendar-view');
-  if (!m || !m.data) { view.innerHTML = emptyMsg(m); $('#cal-meta').textContent = ''; return; }
+  if (!m || !m.data) { view.innerHTML = emptyMsg(m, 'calendar'); $('#cal-meta').textContent = ''; return; }
   const t = new Date(), today = pad(t.getDate()) + '-' + pad(t.getMonth() + 1) + '-' + t.getFullYear();
   const all = m.data[calWeek] || [];
   const rows = all.filter(e => calImpact === 'all' || e.Impact === 'HIGH');
@@ -1856,7 +1966,7 @@ function renderCalendar() {
 /* ---------- OI / PCR ---------- */
 function renderOi() {
   const m = S.oi, view = $('#oi-view');
-  if (!m || !m.data) { view.innerHTML = emptyMsg(m); return; }
+  if (!m || !m.data) { view.innerHTML = emptyMsg(m, 'oi'); return; }
   const sections = []; let sec = null, card = null;
   m.data.forEach(it => {
     if (it.type === 'header') { sec = { label: it.label, cards: [] }; sections.push(sec); card = null; }
@@ -1915,13 +2025,34 @@ function tickClock() {
 
 /* ---------- Polling ---------- */
 const RENDER = { prices: renderPrices, news: onNews, fii: renderFii, calendar: renderCalendar, oi: renderOi };
+const RERENDER = { prices: renderPrices, news: renderNews, fii: renderFii, calendar: renderCalendar, oi: renderOi };
+
+/* A request that never gets an answer counts as a failure, so the offline banner can appear. */
+async function getJson(url, ms) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try {
+    const r = await fetch(url, { cache: 'no-store', signal: ctl.signal });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const isWaiting = k => { const m = S[k]; return !m || (!m.data && !m.error); };
+async function pollStatus() {
+  if (Object.keys(MOD).some(isWaiting)) {
+    try { statusInfo = await getJson('/api/status', 10000); statusFailed = false; } catch (e) { statusFailed = true; }
+    Object.keys(MOD).filter(isWaiting).forEach(k => RERENDER[k]());
+  }
+  setTimeout(pollStatus, 3000);
+}
 
 async function poll(name) {
   try {
     const prev = S[name];
-    const r = await fetch('/api/' + name + '?v=' + (prev ? prev.version : -1), { cache: 'no-store' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const j = await r.json();
+    const j = await getJson('/api/' + name + '?v=' + (prev ? prev.version : -1), 20000);
     skew = j.server_time - Date.now() / 1000;
     failures = 0;
     $('#offline').hidden = true;
@@ -1968,6 +2099,7 @@ renderTiles([]);
 tickClock();
 setInterval(tickClock, 1000);
 Object.keys(RENDER).forEach(poll);
+pollStatus();
 })();
 </script>
 </body>
