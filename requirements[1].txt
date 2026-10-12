@@ -1,0 +1,8 @@
+flask
+gunicorn; sys_platform != "win32"
+pandas
+requests
+yfinance
+beautifulsoup4
+lxml
+tradingview-screener
