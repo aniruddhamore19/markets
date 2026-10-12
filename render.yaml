@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: marketsbyaniruddha
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn wsgi:app --workers 1 --threads 8 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10
+      - key: TZ
+        value: Asia/Kolkata
+      - key: TERMINAL_USER
+        value: friend
+      - key: TERMINAL_PASSWORD
+        sync: false
