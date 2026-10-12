@@ -33,6 +33,7 @@ about a minute to wake it up, then data fills in over the next few seconds.
   now says how long the server has been up and how long each source has been loading.
 - A source that does not answer shows "Timed out after ... the data source is not responding"
   instead of waiting forever.
+- The data refresh process now restarts itself if it ever stops, and `/api/status` shows why.
 - While signed in, open `/api/status` on your site (for example
   `https://marketsbyaniruddha.onrender.com/api/status`) to see what the server is doing.
   Screenshot it if you need help.

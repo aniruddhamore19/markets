@@ -1445,6 +1445,8 @@ TASK_INFO: dict[str, dict[str, Any]] = {
 
 def scheduler_loop(stop: threading.Event) -> None:
     force_all_modules_due()
+    for info in TASK_INFO.values():
+        info.update(running_since=None, stuck=0)
     pending: dict[str, tuple[Any, float]] = {}  # task -> (future, start time)
     stuck: dict[str, list[Any]] = {task: [] for task in TASK_MODULE}  # given up on, still running
     executor = ThreadPoolExecutor(max_workers=24)
@@ -1500,9 +1502,11 @@ def scheduler_loop(stop: threading.Event) -> None:
                     if task == "calendar":
                         mark_done("calendar_actuals")
         except RuntimeError as exc:
-            if "shutdown" in str(exc):
-                break  # the program is exiting; nothing more to refresh
+            if "shutdown" in str(exc) and not threading.main_thread().is_alive():
+                break  # the program is really exiting; nothing more to refresh
             log.exception("scheduler error")
+            if "shutdown" in str(exc):
+                executor = ThreadPoolExecutor(max_workers=24)  # the old pool refuses new work
         except Exception:
             log.exception("scheduler error")
         stop.wait(0.5)
@@ -1518,6 +1522,15 @@ app = Flask(__name__)
 # which is what you want when running it on your own PC.
 AUTH_USER = os.environ.get("TERMINAL_USER", "friend")
 AUTH_PASS = os.environ.get("TERMINAL_PASSWORD", "")
+
+
+@app.before_request
+def keep_refresh_running():
+    # On a web host, make sure the refresh thread is alive inside the very process that answers
+    # requests. Health checks arrive every few seconds, so this also heals it while nobody is watching.
+    if _bg["auto"]:
+        start_background_refresh()
+    return None
 
 
 @app.before_request
@@ -1542,16 +1555,44 @@ def healthz() -> Response:
     return Response("ok", mimetype="text/plain")
 
 
-_bg: dict[str, Any] = {"stop": None}
+_bg: dict[str, Any] = {"thread": None, "pid": None, "auto": False, "last_start": 0.0, "starts": 0, "error": ""}
+_bg_lock = threading.Lock()
+
+
+def _scheduler_main(stop: threading.Event) -> None:
+    """Run the refresh loop and remember why it stopped, if it ever does."""
+    try:
+        scheduler_loop(stop)
+        if not stop.is_set():
+            _bg["error"] = "refresh loop ended unexpectedly"
+            log.error("scheduler ended unexpectedly")
+    except BaseException as exc:  # record anything at all, then let the thread end
+        _bg["error"] = f"{type(exc).__name__}: {exc}"[:300]
+        log.exception("scheduler crashed")
+
+
+def _refresh_alive() -> bool:
+    thread = _bg["thread"]
+    return thread is not None and thread.is_alive() and _bg["pid"] == os.getpid()
 
 
 def start_background_refresh() -> None:
-    """Start the data-refresh thread once. Used by wsgi.py when a web host runs the app."""
-    if _bg["stop"] is not None:
+    """Start the data-refresh thread inside THIS process (used by wsgi.py on a web host).
+
+    Safe to call as often as you like: it does nothing while the thread is healthy, and starts a
+    new one if the thread died or if the process was forked after the thread was started."""
+    _bg["auto"] = True
+    if _refresh_alive():
         return
-    _bg["stop"] = threading.Event()
-    threading.Thread(target=scheduler_loop, args=(_bg["stop"],), daemon=True, name="scheduler").start()
-    log.info("background refresh started")
+    with _bg_lock:
+        if _refresh_alive():
+            return
+        if _bg["pid"] == os.getpid() and time.time() - _bg["last_start"] < 5:
+            return  # it just died in this process: wait a moment so a crash cannot spin
+        thread = threading.Thread(target=_scheduler_main, args=(threading.Event(),), daemon=True, name="scheduler")
+        _bg.update(thread=thread, pid=os.getpid(), last_start=time.time(), starts=_bg["starts"] + 1)
+        thread.start()
+    log.info("background refresh started (pid %s, start #%s)", os.getpid(), _bg["starts"])
 
 
 @app.route("/")
@@ -1585,6 +1626,9 @@ def api_status():
     resp = jsonify(
         uptime=round(now - STARTED_AT, 1),
         scheduler_alive=bool(refresher and refresher.is_alive()),
+        scheduler_error=_bg["error"],
+        scheduler_starts=_bg["starts"],
+        pid=os.getpid(),
         hosted=HOSTED,
         peak_memory_mb=peak_mb,
         tasks=tasks,
@@ -1820,7 +1864,7 @@ function waitDetail(key) {
   if (!statusInfo) return '';
   const bits = ['Server running for ' + fmtDur(statusInfo.uptime) + '.'];
   if (!statusInfo.scheduler_alive) {
-    bits.push('The data refresh process is not running.');
+    bits.push('The data refresh process is not running' + (statusInfo.scheduler_error ? ' (' + statusInfo.scheduler_error + ')' : '') + ' - restarting it.');
   } else {
     const running = (TASKS_OF[key] || []).map(k => statusInfo.tasks[k]).find(t => t && t.running_for != null);
     bits.push(running ? 'This data has been loading for ' + fmtDur(running.running_for) + '.' : 'This data is queued for its first load.');
