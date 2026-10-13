@@ -37,6 +37,17 @@ about a minute to wake it up, then data fills in over the next few seconds.
 - While signed in, open `/api/status` on your site (for example
   `https://marketsbyaniruddha.onrender.com/api/status`) to see what the server is doing.
   Screenshot it if you need help.
+
+## If a tab says "DATA TEMPORARILY UNAVAILABLE": run the connection check
+Open `https://marketsbyaniruddha.onrender.com/diag` (or click "Connection check" at the bottom of
+the terminal). It tests every website the terminal depends on, from the server itself, and shows
+for each one: works, slow, blocked, rate-limited or no answer, how long it took, and where the
+server is located. Screenshot it. A red row means that source cannot load data on this host.
+- **Red on TradingView or Yahoo:** prices cannot load from this host.
+- **Red on NSE, MoneyControl, Investing.com or Opstra:** FII/DII, the calendar or OI/PCR cannot load.
+- **Everything red, even Google:** the server has no internet; wait a minute and test again.
+Prices: if TradingView does not answer within 25 seconds the refresh stops waiting and says why
+on the page. Dollar Index and US 10Y fall back to Yahoo Finance and still show if Yahoo works.
 - On Render the data refreshes more gently than on your PC: prices every 10 seconds, news 30,
   OI/PCR and FII/DII every 2 minutes. This keeps the small free server and the data sources happy.
 

@@ -50,7 +50,7 @@ import threading
 import time
 import warnings
 import webbrowser
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait as wait_futures
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -305,6 +305,10 @@ TASK_TIMEOUT = {"prices": 90, "news": 60, "oi": 120, "fii_attempt": 150, "calend
 MAX_STUCK_PER_TASK = 3
 STARTED_AT = time.time()
 
+# On the small free server, starting every download in the same second makes them all slow.
+# On a web host the first loads are spread out instead (seconds after start). Prices come first.
+FIRST_RUN_DELAY = {"prices": 0, "news": 4, "fii_attempt": 8, "oi": 14, "calendar": 20, "calendar_actuals": 20}
+
 
 def is_due(module: str) -> bool:
     return time.time() >= _next_run.get(module, 0.0)
@@ -358,6 +362,38 @@ def build_watchlist_specs() -> list[dict[str, Any]]:
             spec["candidates"] = [spec["symbol"]]
         specs.append(spec)
     return specs
+
+
+# --- bounded calls: a slow or silent data source must fail fast and say why --------------------
+TV_DEADLINE = 25  # seconds to wait for TradingView
+YF_DEADLINE = 20  # seconds to wait for the Yahoo Finance fallbacks (DXY, US10Y)
+
+_notes_lock = threading.Lock()
+_prices_notes: list[str] = []  # why the last prices refresh was incomplete (shown on /diag)
+_fetch_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="fetch")
+_inflight: dict[str, Any] = {}
+
+
+def add_price_note(text: str) -> None:
+    with _notes_lock:
+        if text not in _prices_notes:
+            _prices_notes.append(text)
+
+
+def short_error(exc: BaseException) -> str:
+    text = f"{type(exc).__name__}: {exc}".strip().rstrip(":")
+    return " ".join(text.split())[:140]
+
+
+def submit_guarded(key: str, func, *args):
+    """Run func in the shared pool. Returns None if the previous call for the same key still has
+    not finished, so a source that never answers cannot pile up more and more waiting threads."""
+    previous = _inflight.get(key)
+    if previous is not None and not previous.done():
+        return None
+    future = _fetch_pool.submit(func, *args)
+    _inflight[key] = future
+    return future
 
 
 def fetch_yfinance_snapshot(yf_symbol: str, scale: float = 1.0) -> tuple[float, float | None]:
@@ -465,8 +501,8 @@ def resolve_watchlist_row(raw_df: pd.DataFrame, spec: dict[str, Any]) -> dict[st
                 "Timestamp": datetime.now().strftime("%H:%M:%S"),
                 "Status": "OK",
             }
-        except Exception:
-            pass
+        except Exception as exc:
+            add_price_note(f"Yahoo Finance {fallback['yf_symbol']}: {short_error(exc)}")
 
     return make_missing_watchlist_row(spec)
 
@@ -517,21 +553,61 @@ def resolve_contract_group_rows(raw_df: pd.DataFrame, specs: list[dict[str, Any]
 
 
 def fetch_market_watchlist() -> pd.DataFrame | None:
+    with _notes_lock:
+        _prices_notes.clear()
     specs = build_watchlist_specs()
     all_symbols = sorted({symbol for spec in specs for symbol in spec["candidates"]})
     raw_df = pd.DataFrame()
-    try:
-        raw_df = fetch_tradingview_rows(all_symbols)
-    except Exception as exc:
-        log.warning("PRICES | TradingView request failed: %s", str(exc)[:120])
+    started = time.time()
+    tv_future = submit_guarded("tradingview", fetch_tradingview_rows, all_symbols)
+    if tv_future is None:
+        add_price_note("TradingView: the request from an earlier refresh still has no answer")
+    else:
+        done, _pending = wait_futures([tv_future], timeout=TV_DEADLINE)
+        if not done:
+            add_price_note(f"TradingView: no answer after {TV_DEADLINE}s")
+            log.warning("PRICES | TradingView gave no answer after %ss", TV_DEADLINE)
+        else:
+            try:
+                raw_df = tv_future.result()
+                if raw_df.empty:
+                    add_price_note("TradingView answered but returned none of the watchlist contracts")
+            except Exception as exc:
+                add_price_note(f"TradingView: {short_error(exc)} (after {time.time() - started:.0f}s)")
+                log.warning("PRICES | TradingView request failed: %s", str(exc)[:120])
 
     resolved_rows: dict[str, dict[str, Any]] = {}
     contract_groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    static_specs: list[dict[str, Any]] = []
     for spec in specs:
         if spec["kind"] == "contract":
             contract_groups.setdefault(contract_group_key(spec), []).append(spec)
         else:
-            resolved_rows[spec["label"]] = resolve_watchlist_row(raw_df, spec)
+            static_specs.append(spec)
+
+    # DXY and US10Y: taken from TradingView when present, otherwise from Yahoo Finance. The Yahoo
+    # lookups run side by side, each with a deadline, so one slow lookup cannot hold up the rest.
+    waiting: dict[Any, dict[str, Any]] = {}
+    for spec in static_specs:
+        future = submit_guarded(f"static:{spec['label']}", resolve_watchlist_row, raw_df, spec)
+        if future is None:
+            add_price_note(f"{spec['label']}: the lookup from an earlier refresh still has no answer")
+            resolved_rows[spec["label"]] = make_missing_watchlist_row(spec)
+        else:
+            waiting[future] = spec
+    if waiting:
+        done, not_done = wait_futures(list(waiting), timeout=YF_DEADLINE)
+        for future in done:
+            spec = waiting[future]
+            try:
+                resolved_rows[spec["label"]] = future.result()
+            except Exception as exc:
+                add_price_note(f"{spec['label']}: {short_error(exc)}")
+                resolved_rows[spec["label"]] = make_missing_watchlist_row(spec)
+        for future in not_done:
+            spec = waiting[future]
+            add_price_note(f"{spec['label']}: Yahoo Finance gave no answer after {YF_DEADLINE}s")
+            resolved_rows[spec["label"]] = make_missing_watchlist_row(spec)
 
     for grouped_specs in contract_groups.values():
         resolved_rows.update(resolve_contract_group_rows(raw_df, grouped_specs))
@@ -1353,7 +1429,9 @@ def prices_payload(df: pd.DataFrame | None) -> list[dict[str, Any]]:
     if df is None or df.empty:
         raise ValueError("Price watchlist is empty")
     if not pd.to_numeric(df["Price"], errors="coerce").notna().any():
-        raise ValueError("No prices returned by the data sources")
+        with _notes_lock:
+            why = " | ".join(_prices_notes)
+        raise ValueError(f"No prices returned. {why}" if why else "No prices returned by the data sources")
     return clean(df.to_dict(orient="records"))
 
 
@@ -1431,7 +1509,7 @@ def finish_task(task: str, future) -> None:
             payload = calendar_payload(result)
         store.set(module, payload)
     except Exception as exc:
-        store.fail(module, (str(exc) or type(exc).__name__)[:200])
+        store.fail(module, (str(exc) or type(exc).__name__)[:400])
     finally:
         mark_done(task)
         if task == "calendar":
@@ -1445,6 +1523,10 @@ TASK_INFO: dict[str, dict[str, Any]] = {
 
 def scheduler_loop(stop: threading.Event) -> None:
     force_all_modules_due()
+    if HOSTED:
+        begin = time.time()
+        for key, delay in FIRST_RUN_DELAY.items():
+            _next_run[key] = begin + delay
     for info in TASK_INFO.values():
         info.update(running_since=None, stuck=0)
     pending: dict[str, tuple[Any, float]] = {}  # task -> (future, start time)
@@ -1602,6 +1684,168 @@ def index() -> Response:
     return resp
 
 
+def peak_memory_mb() -> float | None:
+    if sys.platform != "linux":
+        return None
+    try:
+        import resource
+
+        return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+    except Exception:
+        return None
+
+
+# --- connection check: which data sources can THIS server actually reach? -----------------------
+DIAG_TIMEOUT = 8  # seconds each website gets to answer
+DIAG_TOTAL = 20  # seconds for the whole check
+DIAG_PROBES: list[tuple[str, str, str]] = [
+    # (what it feeds, name, url or special test)
+    ("Network", "Internet (Google)", "https://www.google.com/generate_204"),
+    ("Network", "This server's location", "https://ipinfo.io/json"),
+    ("Prices", "TradingView (the real price query)", "special:tradingview"),
+    ("Prices", "Yahoo Finance (plain request)", "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=1d&interval=1d"),
+    ("Prices", "Yahoo Finance (yfinance, as the app uses it)", "special:yfinance"),
+    ("News", "Mint", "https://www.livemint.com/rss/markets"),
+    ("News", "The Guardian", "https://www.theguardian.com/business/rss"),
+    ("News", "Times of India", "https://timesofindia.indiatimes.com/rssfeeds/1898055.cms"),
+    ("News", "Google News", "https://news.google.com/rss/search?q=gold&hl=en-IN&gl=IN&ceid=IN:en"),
+    ("FII / DII", "NSE India", "https://www.nseindia.com"),
+    ("FII / DII", "MoneyControl", "https://www.moneycontrol.com/stocks/marketstats/fii_dii_activity/index.php"),
+    ("Calendar", "Forex Factory data feed", "https://nfs.faireconomy.media/ff_calendar_thisweek.json"),
+    ("Calendar", "Investing.com", "https://in.investing.com/economic-calendar/"),
+    ("OI / PCR", "Opstra", "https://opstra.definedge.com"),
+]
+_diag_lock = threading.Lock()
+_diag_cache: dict[str, Any] = {"at": 0.0, "data": None}
+
+
+def classify_status(code: int, secs: float) -> tuple[str, str]:
+    if code in (401, 403, 451):
+        return "blocked", f"HTTP {code}: the site refuses this server's address"
+    if code == 429:
+        return "limited", "HTTP 429: too many requests from this address"
+    if code >= 500:
+        return "error", f"HTTP {code}: the site itself has a problem"
+    if code >= 400:
+        return "ok", f"HTTP {code}: the site answered (this exact page is missing, but it is reachable)"
+    if secs > 4:
+        return "slow", f"HTTP {code}, but it took {secs:.1f}s"
+    return "ok", f"HTTP {code}"
+
+
+def friendly_connection_error(exc: BaseException) -> str:
+    text = str(exc).lower()
+    if "name or service not known" in text or "getaddrinfo" in text or "nodename nor servname" in text:
+        return "the address could not be looked up (DNS)"
+    if "refused" in text:
+        return "the connection was refused"
+    if "reset" in text or "remotedisconnected" in text or "closed connection" in text or "aborted" in text:
+        return "the site closed the connection without answering (often how a block looks)"
+    if "ssl" in text or "certificate" in text:
+        return "secure connection (TLS) failed"
+    if "proxy" in text or "tunnel" in text:
+        return "a proxy refused the connection"
+    if "timed out" in text or "timeout" in text:
+        return f"no answer within {DIAG_TIMEOUT}s"
+    return short_error(exc)[:110]
+
+
+def run_probe(group: str, name: str, target: str) -> dict[str, Any]:
+    began = time.time()
+    state, status, detail = "error", None, ""
+    try:
+        if target == "special:tradingview":
+            symbols = sorted({s for spec in build_watchlist_specs() for s in spec["candidates"]})
+            frame = fetch_tradingview_rows(symbols)
+            found = int(frame["name"].nunique()) if "name" in frame else 0
+            state = "ok" if found else "error"
+            detail = f"answered with {len(frame)} rows ({found} of the {len(symbols)} watchlist contracts found)"
+        elif target == "special:yfinance":
+            price, _chg = fetch_yfinance_snapshot("GC=F")
+            state, detail = "ok", f"gold futures price {price}"
+        else:
+            resp = requests.get(target, headers=HEADERS, timeout=DIAG_TIMEOUT, stream=True)
+            status = resp.status_code
+            if "ipinfo.io" in target and status == 200:
+                try:
+                    info = resp.json()
+                    where = ", ".join(x for x in (info.get("city"), info.get("region"), info.get("country")) if x)
+                    detail = f"{where} - {info.get('org', '')}".strip(" -")
+                except Exception:
+                    detail = ""
+            resp.close()
+            secs = time.time() - began
+            state, note = classify_status(status, secs)
+            detail = detail or note
+            if "ipinfo.io" in target and status == 200:
+                state = "ok"
+    except requests.exceptions.Timeout:
+        state, detail = "timeout", f"no answer within {DIAG_TIMEOUT}s"
+    except requests.exceptions.ConnectionError as exc:
+        state, detail = "unreachable", friendly_connection_error(exc)
+    except Exception as exc:
+        state, detail = "error", short_error(exc)
+    return {
+        "group": group,
+        "name": name,
+        "state": state,
+        "status": status,
+        "secs": round(time.time() - began, 1),
+        "detail": detail,
+    }
+
+
+def run_diagnostics() -> dict[str, Any]:
+    with _diag_lock:  # one check at a time; a repeat within 15 seconds reuses the last result
+        if _diag_cache["data"] is not None and time.time() - _diag_cache["at"] < 15:
+            return _diag_cache["data"]
+        began = time.time()
+        pool = ThreadPoolExecutor(max_workers=len(DIAG_PROBES))
+        futures = {pool.submit(run_probe, g, n, t): (g, n) for g, n, t in DIAG_PROBES}
+        done, not_done = wait_futures(list(futures), timeout=DIAG_TOTAL)
+        pool.shutdown(wait=False)
+        results = []
+        for future, (group, name) in futures.items():
+            if future in done:
+                results.append(future.result())
+            else:
+                results.append(
+                    {"group": group, "name": name, "state": "timeout", "status": None,
+                     "secs": float(DIAG_TOTAL), "detail": f"no answer within {DIAG_TOTAL}s"}
+                )
+        data = {
+            "ran_at": time.time(),
+            "took": round(time.time() - began, 1),
+            "probes": results,
+            "server": {
+                "uptime": round(time.time() - STARTED_AT, 1),
+                "hosted": HOSTED,
+                "peak_memory_mb": peak_memory_mb(),
+                "python": sys.version.split()[0],
+                "pid": os.getpid(),
+                "refresh_starts": _bg["starts"],
+                "refresh_error": _bg["error"],
+                "prices_notes": list(_prices_notes),
+            },
+        }
+        _diag_cache.update(at=time.time(), data=data)
+        return data
+
+
+@app.route("/api/diag")
+def api_diag():
+    resp = jsonify(run_diagnostics())
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/diag")
+def diag_page() -> Response:
+    resp = Response(DIAG_HTML, mimetype="text/html")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.route("/api/status")
 def api_status():
     """What the server is doing right now. The page shows this while it waits for data."""
@@ -1614,14 +1858,6 @@ def api_status():
             "last_duration": info["last_duration"],
             "stuck": info["stuck"],
         }
-    peak_mb = None
-    if sys.platform == "linux":
-        try:
-            import resource
-
-            peak_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
-        except Exception:
-            pass
     refresher = next((t for t in threading.enumerate() if t.name == "scheduler"), None)
     resp = jsonify(
         uptime=round(now - STARTED_AT, 1),
@@ -1630,7 +1866,8 @@ def api_status():
         scheduler_starts=_bg["starts"],
         pid=os.getpid(),
         hosted=HOSTED,
-        peak_memory_mb=peak_mb,
+        peak_memory_mb=peak_memory_mb(),
+        prices_notes=list(_prices_notes),
         tasks=tasks,
         modules={name: store.brief(name) for name in MODULE_INTERVAL},
         versions={"python": sys.version.split()[0], "pandas": pd.__version__, "yfinance": getattr(yf, "__version__", None)},
@@ -1648,6 +1885,122 @@ def api_module(name: str):
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
+
+DIAG_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connection check - Kotak Desk</title>
+<style>
+:root{--bg:#000;--panel:#0e0e10;--line:#232327;--txt:#ebe8e2;--dim:#8c8c96;--amber:#ffb000;--up:#2bd67b;--dn:#ff5c5c;--link:#6db3ff;
+  --mono:"Cascadia Mono","JetBrains Mono",Consolas,"SF Mono",Menlo,monospace;--sans:"Segoe UI",system-ui,-apple-system,Roboto,Arial,sans-serif}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.5 var(--sans)}
+main{max-width:1000px;margin:0 auto;padding:18px 16px 48px}
+a{color:var(--link)}
+h1{font:700 18px var(--mono);color:var(--amber);margin:0 0 6px}
+.lead{color:var(--dim);margin:0 0 14px;max-width:72ch}
+.bar{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin:14px 0}
+button{font:600 12px var(--mono);background:var(--amber);color:#000;border:0;border-radius:3px;padding:7px 14px;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+button:focus-visible,a:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+#state{font:12px var(--mono);color:var(--dim)}
+#server{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:10px 14px;font:12px/1.7 var(--mono);color:var(--dim);margin-bottom:14px}
+#server:empty{display:none}
+.wrap{overflow-x:auto;border:1px solid var(--line);border-radius:4px}
+table{border-collapse:collapse;width:100%;min-width:720px}
+th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+th{background:#151518;color:var(--amber);font:600 11px var(--mono)}
+td.grp{color:var(--dim);font:12px var(--mono);white-space:nowrap}
+td.num{font:12px var(--mono);white-space:nowrap}
+td.det{color:var(--dim);font-size:13px}
+td.res{white-space:nowrap;font-weight:600}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:8px;background:var(--dim)}
+.res.ok{color:var(--up)} .res.ok .dot{background:var(--up)}
+.res.slow{color:var(--amber)} .res.slow .dot{background:var(--amber)}
+.res.blocked,.res.limited,.res.timeout,.res.unreachable,.res.error{color:var(--dn)}
+.res.blocked .dot,.res.limited .dot,.res.timeout .dot,.res.unreachable .dot,.res.error .dot{background:var(--dn)}
+ul{color:var(--dim);max-width:72ch;padding-left:20px;margin:18px 0 0}
+li{margin:4px 0}
+</style>
+</head>
+<body>
+<main>
+  <h1>Connection check</h1>
+  <p class="lead">This tests every website the terminal depends on, from the server that runs it. A source that shows red here cannot load data on the terminal.</p>
+  <div class="bar"><button id="again" type="button">Test again</button><a href="/">Back to the terminal</a><span id="state" role="status"></span></div>
+  <div id="server"></div>
+  <div class="wrap"><table>
+    <thead><tr><th>Feeds</th><th>Source</th><th>Result</th><th>Time</th><th>Details</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table></div>
+  <ul>
+    <li><b>Works</b>: the site answered normally.</li>
+    <li><b>Blocked</b> or <b>Rate-limited</b>: the site answered but refuses or limits this server's address. Websites often do this to cloud servers.</li>
+    <li><b>No answer</b> or <b>Can't connect</b>: the site ignored or refused the connection.</li>
+  </ul>
+</main>
+<script>
+(() => {
+'use strict';
+const $ = s => document.querySelector(s);
+const LABEL = { ok: 'Works', slow: 'Slow', blocked: 'Blocked', limited: 'Rate-limited', timeout: 'No answer', unreachable: "Can't connect", error: 'Problem' };
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+const fmtDur = s => s < 90 ? Math.round(s) + ' seconds' : Math.round(s / 60) + ' minutes';
+
+function render(d) {
+  const s = d.server, lines = [];
+  lines.push('Server running for ' + fmtDur(s.uptime) + (s.hosted ? ' (on the web host).' : ' (on your own computer).'));
+  if (s.peak_memory_mb != null) lines.push('Highest memory use so far: ' + s.peak_memory_mb + ' MB (the free plan allows 512 MB).');
+  lines.push('Data refresh process has started ' + s.refresh_starts + ' time(s)' + (s.refresh_error ? '; last problem: ' + s.refresh_error : '') + '.');
+  (s.prices_notes || []).forEach(n => lines.push('Last prices refresh: ' + n));
+  const box = $('#server'); box.textContent = '';
+  lines.forEach(l => box.appendChild(el('div', null, l)));
+
+  const body = $('#rows'); body.textContent = '';
+  let lastGroup = '';
+  d.probes.forEach(p => {
+    const tr = el('tr');
+    tr.appendChild(el('td', 'grp', p.group === lastGroup ? '' : p.group));
+    lastGroup = p.group;
+    tr.appendChild(el('td', null, p.name));
+    const res = el('td', 'res ' + p.state);
+    res.appendChild(el('span', 'dot'));
+    res.appendChild(document.createTextNode(LABEL[p.state] || p.state));
+    tr.appendChild(res);
+    tr.appendChild(el('td', 'num', p.secs + 's'));
+    tr.appendChild(el('td', 'det', p.detail));
+    body.appendChild(tr);
+  });
+  const bad = d.probes.filter(p => p.state !== 'ok' && p.state !== 'slow').length;
+  $('#state').textContent = (bad ? bad + ' of ' + d.probes.length + ' sources failed from this server.' : 'Every source answered.') + ' Finished in ' + d.took + ' seconds.';
+}
+
+async function run() {
+  const btn = $('#again');
+  btn.disabled = true;
+  $('#state').textContent = 'Testing every source from the server. This takes up to 20 seconds...';
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 45000);
+  try {
+    const r = await fetch('/api/diag', { cache: 'no-store', signal: ctl.signal });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    render(await r.json());
+  } catch (e) {
+    $('#state').textContent = 'The check could not run (' + e.message + '). The server may be restarting - wait a minute and test again.';
+  } finally {
+    clearTimeout(timer);
+    btn.disabled = false;
+  }
+}
+$('#again').addEventListener('click', run);
+run();
+})();
+</script>
+</body>
+</html>
+"""
 
 INDEX_HTML = r"""<!doctype html>
 <html lang="en">
@@ -1743,6 +2096,7 @@ td.fdn{animation:fdn 1.1s ease-out}
 .bad{color:var(--dn)}
 
 .foot{flex:none;padding:5px 14px;border-top:1px solid var(--line);font:11px var(--mono);color:var(--dim);background:var(--panel)}
+.foot a{margin-left:10px}
 .empty{padding:70px 20px;text-align:center;color:var(--dim);font:13px var(--mono)}
 .empty b{color:var(--dn);display:block;font-size:14px;margin-bottom:8px}
 .empty small{display:block;margin-top:12px;font-size:12px}
@@ -1833,7 +2187,7 @@ td.fdn{animation:fdn 1.1s ease-out}
 
   <section class="pane" id="pane-oi"><div class="scroll" id="oi-view"></div></section>
 </main>
-<footer class="foot">Data comes from public sources and can be delayed, incomplete or wrong. For information only, not investment advice.</footer>
+<footer class="foot">Data comes from public sources and can be delayed, incomplete or wrong. For information only, not investment advice. <a href="/diag" target="_blank" rel="noopener">Connection check</a></footer>
 
 <script>
 (() => {
@@ -1872,7 +2226,7 @@ function waitDetail(key) {
   return '<small>' + esc(bits.join(' ')) + '</small>';
 }
 function emptyMsg(m, key) {
-  if (m && m.error) return '<div class="empty"><b>[!] DATA TEMPORARILY UNAVAILABLE</b>' + esc(m.error) + '<br>Retrying automatically.</div>';
+  if (m && m.error) return '<div class="empty"><b>[!] DATA TEMPORARILY UNAVAILABLE</b>' + esc(m.error) + '<br>Retrying automatically.<small><a href="/diag" target="_blank" rel="noopener">Test which data sources this server can reach</a></small></div>';
   return '<div class="empty">Waiting for the first data...' + waitDetail(key) + '</div>';
 }
 function staleNote(m) {
